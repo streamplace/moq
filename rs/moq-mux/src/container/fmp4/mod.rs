@@ -11,11 +11,13 @@ pub mod fragment;
 mod fragmenter;
 mod import;
 mod muxer;
+mod passthrough;
 
 pub use export::*;
 pub use fragmenter::*;
 pub use import::*;
 pub use muxer::*;
+pub use passthrough::*;
 
 /// Re-export of the [`mp4_atom`] crate, whose types appear in this module's public API.
 /// A major version bump of `mp4_atom` is a breaking change for moq-mux.
@@ -209,6 +211,18 @@ pub enum Error {
 		/// The preceding fragment's decode time in the track's timescale.
 		previous: moq_net::Timestamp,
 	},
+
+	/// A passthrough fragment's top-level boxes ended partway through one.
+	#[error("truncated fragment")]
+	TruncatedFragment,
+
+	/// A passthrough fragment carries a box out of place.
+	#[error("unexpected {0} box: a fragment is optional leading boxes, then one moof and one mdat")]
+	UnexpectedFragmentBox(mp4_atom::FourCC),
+
+	/// A passthrough fragment's moof describes more than its one track.
+	#[error("moof has {0} trafs, expected one")]
+	MultipleTrafs(usize),
 }
 
 impl From<mp4_atom::Error> for Error {

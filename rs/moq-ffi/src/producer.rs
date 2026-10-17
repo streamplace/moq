@@ -453,6 +453,26 @@ impl MoqBroadcastProducer {
 		}))
 	}
 
+	/// Publish a CMAF track whose fragments are delivered byte for byte.
+	///
+	/// `init` is the track's CMAF init segment (ftyp+moov with exactly one trak). It becomes the
+	/// catalog rendition's CMAF container init unchanged, and the rest of the rendition (codec,
+	/// description, coded size, sample rate, channels) is derived from it as `publish_container`
+	/// derives it for fMP4. The catalog entry lasts as long as the track.
+	pub fn publish_cmaf(&self, name: String, init: Vec<u8>) -> Result<Arc<MoqCmafProducer>, MoqError> {
+		let _guard = crate::ffi::enter();
+		let guard = self.state.lock().unwrap();
+		let state = guard.as_ref().ok_or(MoqError::Closed)?;
+
+		let track =
+			moq_mux::container::fmp4::Passthrough::new(&state.broadcast, state.catalog.reserve(), name, init.into())
+				.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
+
+		Ok(Arc::new(MoqCmafProducer {
+			inner: std::sync::Mutex::new(Some(track)),
+		}))
+	}
+
 	/// Create a track for arbitrary byte payloads, no codec or container.
 	///
 	/// Same pattern as moq-boy's `status` and `command` tracks: raw UTF-8/JSON
@@ -1151,6 +1171,109 @@ impl MoqContainerStreamProducer {
 			.import
 			.finish()
 			.map_err(|err| MoqError::Codec(format!("finish failed: {err}")))?;
+		Ok(())
+	}
+}
+
+// ---- CMAF Producer ----
+
+/// A CMAF track whose fragments are delivered byte for byte.
+///
+/// Made by [`MoqBroadcastProducer::publish_cmaf`]. The caller draws the groups. The track is not
+/// enrolled in the broadcast's timeline, and its rendition carries no measured bitrate or jitter.
+#[derive(uniffi::Object)]
+pub struct MoqCmafProducer {
+	inner: std::sync::Mutex<Option<moq_mux::container::fmp4::Passthrough<Extra>>>,
+}
+
+#[uniffi::export]
+impl MoqCmafProducer {
+	/// Create the group numbered `sequence`.
+	pub fn create_group(&self, sequence: u64) -> Result<Arc<MoqCmafGroupProducer>, MoqError> {
+		let _guard = crate::ffi::enter();
+		let mut guard = self.inner.lock().unwrap();
+		let track = guard.as_mut().ok_or(MoqError::Closed)?;
+		Ok(MoqCmafGroupProducer::new(track.create_group(sequence)?))
+	}
+
+	/// Append a new group after the latest one.
+	pub fn append_group(&self) -> Result<Arc<MoqCmafGroupProducer>, MoqError> {
+		let _guard = crate::ffi::enter();
+		let mut guard = self.inner.lock().unwrap();
+		let track = guard.as_mut().ok_or(MoqError::Closed)?;
+		Ok(MoqCmafGroupProducer::new(track.append_group()?))
+	}
+
+	/// End the track at the live edge and retire its catalog entry.
+	pub fn finish(&self) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let track = self.inner.lock().unwrap().take().ok_or(MoqError::Closed)?;
+		track.finish()?;
+		Ok(())
+	}
+
+	/// Abort the track with an application error code and retire its catalog entry.
+	pub fn abort(&self, error_code: u16) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let track = self.inner.lock().unwrap().take().ok_or(MoqError::Closed)?;
+		track.abort(moq_net::Error::App(error_code))?;
+		Ok(())
+	}
+}
+
+/// One group of a CMAF track, where each fragment is one frame.
+#[derive(uniffi::Object)]
+pub struct MoqCmafGroupProducer {
+	sequence: u64,
+	inner: std::sync::Mutex<Option<moq_mux::container::fmp4::PassthroughGroup>>,
+}
+
+impl MoqCmafGroupProducer {
+	fn new(group: moq_mux::container::fmp4::PassthroughGroup) -> Arc<Self> {
+		Arc::new(Self {
+			sequence: group.sequence(),
+			inner: std::sync::Mutex::new(Some(group)),
+		})
+	}
+}
+
+#[uniffi::export]
+impl MoqCmafGroupProducer {
+	/// The sequence number of this group within the track.
+	pub fn sequence(&self) -> u64 {
+		self.sequence
+	}
+
+	/// Write one CMAF fragment as one frame, unchanged.
+	///
+	/// A fragment is any leading top-level boxes (e.g. `uuid`), then exactly one `moof`, holding a
+	/// single `traf` for this track, and one `mdat`. The frame timestamp is the first sample's
+	/// presentation time (`tfdt` plus the first `trun` composition offset) on the init's `mdhd`
+	/// timescale. A malformed fragment is refused with nothing written.
+	pub fn write_fragment(&self, fragment: Vec<u8>) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let mut guard = self.inner.lock().unwrap();
+		let group = guard.as_mut().ok_or(MoqError::Closed)?;
+		group.write(fragment.into())?;
+		Ok(())
+	}
+
+	/// Mark the group as complete. No more fragments can be written.
+	///
+	/// The handle remains so a later [`abort`](Self::abort) can still run.
+	pub fn finish(&self) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let mut guard = self.inner.lock().unwrap();
+		let group = guard.as_mut().ok_or(MoqError::Closed)?;
+		group.finish()?;
+		Ok(())
+	}
+
+	/// Abort this group with an application error code.
+	pub fn abort(&self, error_code: u16) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let group = self.inner.lock().unwrap().take().ok_or(MoqError::Closed)?;
+		group.abort(moq_net::Error::App(error_code))?;
 		Ok(())
 	}
 }

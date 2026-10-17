@@ -1170,6 +1170,73 @@ async fn fetch_media_group_decodes_multiple_cmaf_samples() {
 }
 
 #[tokio::test]
+async fn cmaf_fragments_pass_through_unchanged() {
+	let mut config = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 2);
+	config.description = Some(opus_head().into());
+	let muxer = moq_mux::container::fmp4::Muxer::audio(&config).unwrap();
+	let init = muxer.init().unwrap().expect("Opus init should be available");
+	let fragment = muxer
+		.fragment(
+			1,
+			&[moq_mux::container::Frame {
+				timestamp: moq_net::Timestamp::from_micros(2_000_000).unwrap(),
+				payload: bytes::Bytes::from_static(b"opus packet"),
+				keyframe: true,
+				duration: Some(moq_net::Timestamp::from_micros(20_000).unwrap()),
+			}],
+		)
+		.unwrap();
+	// A signed MUXL fragment leads with uuid boxes, which have to survive untouched.
+	let mut payload = vec![0, 0, 0, 24];
+	payload.extend_from_slice(b"uuid");
+	payload.extend_from_slice(&[7; 16]);
+	payload.extend_from_slice(&fragment);
+
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let consumer = broadcast.consume().unwrap();
+	let catalog_consumer = consumer.subscribe_catalog().await.unwrap();
+	let track = broadcast.publish_cmaf("audio".into(), init.to_vec()).unwrap();
+
+	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
+		.await
+		.expect("timed out waiting for catalog")
+		.unwrap()
+		.expect("expected a catalog");
+	let audio = &catalog.audio["audio"];
+	assert_eq!(audio.codec, "opus");
+	assert_eq!(audio.description.as_deref(), Some(opus_head().as_slice()));
+	assert!(
+		matches!(&audio.container, crate::media::MoqContainer::Cmaf { init: catalog_init } if *catalog_init == init)
+	);
+
+	let subscription = consumer.subscribe_track("audio".into(), None).await.unwrap();
+	let group = track.create_group(3).unwrap();
+	assert_eq!(group.sequence(), 3);
+	group.write_fragment(payload.clone()).unwrap();
+	assert!(matches!(
+		group.write_fragment(fragment[..8].to_vec()),
+		Err(MoqError::Mux(_))
+	));
+	group.finish().unwrap();
+
+	let frame = tokio::time::timeout(TIMEOUT, subscription.read_frame())
+		.await
+		.expect("timed out waiting for CMAF frame")
+		.unwrap()
+		.expect("expected a frame");
+	assert_eq!(frame.payload, payload);
+	assert_eq!(frame.timestamp_us, 2_000_000);
+
+	track.finish().unwrap();
+	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
+		.await
+		.expect("timed out waiting for catalog update")
+		.unwrap()
+		.expect("expected a catalog update");
+	assert!(catalog.audio.is_empty(), "finish should retire the rendition");
+}
+
+#[tokio::test]
 async fn dynamic_track_serves_fetch_miss_and_priority() {
 	let broadcast = MoqBroadcastProducer::new().unwrap();
 	let track = broadcast.publish_track("events".into(), None).unwrap();
