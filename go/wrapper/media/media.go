@@ -73,6 +73,15 @@ func NewTimebase(broadcast *moq.BroadcastProducer) (*Timebase, error) {
 // Close releases this timebase handle on the calling goroutine; existing imports keep their offset.
 func (t *Timebase) Close() { t.inner.Destroy() }
 
+// CmafInit describes a CMAF track's init segment and an optional shared timebase.
+type CmafInit struct {
+	// Data is the track's CMAF init segment: ftyp+moov with exactly one trak.
+	Data []byte
+	// Timebase shares a source offset, or nil for an independent offset. Tracks cut
+	// from one source share its timestamps, so give them one timebase.
+	Timebase *Timebase
+}
+
 // ContainerInit describes a container, its leading bytes and an optional shared timebase.
 type ContainerInit struct {
 	// Format selects the container parser.
@@ -229,6 +238,29 @@ func NewContainerStreamProducer(broadcast *moq.BroadcastProducer, init Container
 		return nil, err
 	}
 	return &ContainerStreamProducer{inner: inner}, nil
+}
+
+// NewCmafProducer publishes a CMAF track on target whose fragments are delivered verbatim.
+// init.Data is the catalog rendition's cmaf container init, byte for byte, and the rest
+// of the rendition (codec, description, coded size, sample rate, channels) is derived
+// from it as the fMP4 importer does. The catalog entry lasts as long as the track.
+//
+// The track is not enrolled in the broadcast's timeline, and its rendition carries
+// no measured bitrate or jitter.
+func NewCmafProducer(broadcast *moq.BroadcastProducer, target Target, init CmafInit) (*CmafProducer, error) {
+	resolved, err := targetFFI(target)
+	if err != nil {
+		return nil, err
+	}
+	var timebase **ffi.MoqMediaTimebase
+	if init.Timebase != nil {
+		timebase = &init.Timebase.inner
+	}
+	inner, err := ffi.NewMoqMediaCmafProducer(bridge.BroadcastProducer(broadcast), resolved, ffi.MoqCmafInit{Data: init.Data, Timebase: timebase})
+	if err != nil {
+		return nil, err
+	}
+	return &CmafProducer{inner: inner}, nil
 }
 
 // NewCatalogConsumer subscribes to broadcast's catalog snapshots.
@@ -464,6 +496,69 @@ func (c *ContainerStreamProducer) Write(payload []byte) error {
 // Finish finishes every track this container publishes.
 func (c *ContainerStreamProducer) Finish() error {
 	return c.inner.Finish()
+}
+
+// CmafProducer publishes one CMAF track fragment by fragment, each byte for
+// byte. The caller draws the groups.
+type CmafProducer struct {
+	inner *ffi.MoqMediaCmafProducer
+}
+
+// CreateGroup creates the group numbered sequence.
+func (c *CmafProducer) CreateGroup(sequence uint64) (*CmafGroupProducer, error) {
+	inner, err := c.inner.CreateGroup(sequence)
+	if err != nil {
+		return nil, err
+	}
+	return &CmafGroupProducer{inner: inner}, nil
+}
+
+// AppendGroup creates the group after the latest one.
+func (c *CmafProducer) AppendGroup() (*CmafGroupProducer, error) {
+	inner, err := c.inner.AppendGroup()
+	if err != nil {
+		return nil, err
+	}
+	return &CmafGroupProducer{inner: inner}, nil
+}
+
+// Finish ends the track at the live edge and retires its catalog entry.
+func (c *CmafProducer) Finish() error {
+	return c.inner.Finish()
+}
+
+// Abort ends the track with an application error code and retires its catalog entry.
+func (c *CmafProducer) Abort(errorCode uint16) error {
+	return c.inner.Abort(errorCode)
+}
+
+// CmafGroupProducer writes CMAF fragments into one group, one frame each.
+type CmafGroupProducer struct {
+	inner *ffi.MoqMediaCmafGroupProducer
+}
+
+// Sequence is this group's sequence number within the track.
+func (g *CmafGroupProducer) Sequence() uint64 {
+	return g.inner.Sequence()
+}
+
+// WriteFragment writes one CMAF fragment of this track as one frame, unchanged:
+// optional leading top-level boxes (e.g. uuid), then exactly one moof and one mdat.
+// The frame timestamp is the fragment's first sample PTS (tfdt + first trun cts),
+// on the track's timescale (the init's mdhd timescale), shifted onto the catalog
+// clock by the timebase.
+func (g *CmafGroupProducer) WriteFragment(fragment []byte) error {
+	return g.inner.WriteFragment(fragment)
+}
+
+// Finish marks the group complete. The handle remains so Abort can still run.
+func (g *CmafGroupProducer) Finish() error {
+	return g.inner.Finish()
+}
+
+// Abort terminates the group with an application error code.
+func (g *CmafGroupProducer) Abort(errorCode uint16) error {
+	return g.inner.Abort(errorCode)
 }
 
 // TrackStreamProducer feeds a raw encoder byte stream; whole frames are emitted

@@ -31,6 +31,11 @@ and do not keep it open; release the handle with `Close` on the calling goroutin
 For arrival-order reads, decode each group from `moq.TrackConsumer.RecvGroup` with
 `media.NewGroupConsumer`; frames carry container media time as they land. `media.FetchGroup`
 fetches and decodes one past group.
+`NewCmafProducer` publishes one CMAF track whose fragments go out byte for byte, for a source
+that signs them. Its `CmafInit.Data` (ftyp+moov with one trak) is the rendition's CMAF init
+unchanged; you draw the groups, and `WriteFragment` takes any leading boxes (such as `uuid`),
+one `moof`, and one `mdat`. Give the tracks of one source one timebase. The track skips the
+timeline and the catalog's bitrate and jitter measurement.
 
 ```bash
 go get moq.dev/moq@latest
