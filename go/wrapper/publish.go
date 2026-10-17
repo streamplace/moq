@@ -191,6 +191,22 @@ func (b *BroadcastProducer) PublishContainerStream(format ContainerFormat) (*Con
 	return &ContainerStreamProducer{inner: inner}, nil
 }
 
+// PublishCMAF publishes a CMAF track whose fragments are delivered verbatim.
+// init is the track's CMAF init segment (ftyp+moov with exactly one trak); it is
+// the catalog rendition's cmaf container init, byte for byte, and the rest of the
+// rendition (codec, description, coded size, sample rate, channels) is derived
+// from it as the fMP4 importer does. The catalog entry lasts as long as the track.
+//
+// The track is not enrolled in the broadcast's timeline, and its rendition
+// carries no measured bitrate or jitter.
+func (b *BroadcastProducer) PublishCMAF(name string, init []byte) (*CMAFProducer, error) {
+	inner, err := b.inner.PublishCmaf(name, init)
+	if err != nil {
+		return nil, err
+	}
+	return &CMAFProducer{inner: inner}, nil
+}
+
 // EncodeAudio publishes a raw-audio track with an in-process encoder.
 //
 // Select the codec with OpusAudioCodec or AacAudioCodec.
@@ -617,6 +633,68 @@ func (g *GroupProducer) Finish() error {
 
 // Abort terminates the group with an application error code.
 func (g *GroupProducer) Abort(errorCode uint16) error {
+	return g.inner.Abort(errorCode)
+}
+
+// CMAFProducer publishes one CMAF track fragment by fragment, each byte for
+// byte. The caller draws the groups.
+type CMAFProducer struct {
+	inner *ffi.MoqCmafProducer
+}
+
+// CreateGroup creates the group numbered sequence.
+func (c *CMAFProducer) CreateGroup(sequence uint64) (*CMAFGroupProducer, error) {
+	inner, err := c.inner.CreateGroup(sequence)
+	if err != nil {
+		return nil, err
+	}
+	return &CMAFGroupProducer{inner: inner}, nil
+}
+
+// AppendGroup creates the group after the latest one.
+func (c *CMAFProducer) AppendGroup() (*CMAFGroupProducer, error) {
+	inner, err := c.inner.AppendGroup()
+	if err != nil {
+		return nil, err
+	}
+	return &CMAFGroupProducer{inner: inner}, nil
+}
+
+// Finish ends the track at the live edge and retires its catalog entry.
+func (c *CMAFProducer) Finish() error {
+	return c.inner.Finish()
+}
+
+// Abort ends the track with an application error code and retires its catalog entry.
+func (c *CMAFProducer) Abort(errorCode uint16) error {
+	return c.inner.Abort(errorCode)
+}
+
+// CMAFGroupProducer writes CMAF fragments into one group, one frame each.
+type CMAFGroupProducer struct {
+	inner *ffi.MoqCmafGroupProducer
+}
+
+// Sequence is this group's sequence number within the track.
+func (g *CMAFGroupProducer) Sequence() uint64 {
+	return g.inner.Sequence()
+}
+
+// WriteFragment writes one CMAF fragment of this track as one frame, unchanged:
+// optional leading top-level boxes (e.g. uuid), then exactly one moof and one mdat.
+// The frame timestamp is the fragment's first sample PTS (tfdt + first trun cts),
+// on the track's timescale (the init's mdhd timescale).
+func (g *CMAFGroupProducer) WriteFragment(fragment []byte) error {
+	return g.inner.WriteFragment(fragment)
+}
+
+// Finish marks the group complete. The handle remains so Abort can still run.
+func (g *CMAFGroupProducer) Finish() error {
+	return g.inner.Finish()
+}
+
+// Abort terminates the group with an application error code.
+func (g *CMAFGroupProducer) Abort(errorCode uint16) error {
 	return g.inner.Abort(errorCode)
 }
 

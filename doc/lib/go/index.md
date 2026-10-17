@@ -73,6 +73,8 @@ For locally encoded media, call `MediaProducer.Flush(timestampUs)` after `WriteF
 
 Call `media.Discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds. On a video track, resume with a keyframe: a delta frame before it fails.
 
+`PublishCMAF(name, init)` publishes a CMAF track whose fragments go out byte for byte, for a source that signs them or otherwise needs them untouched. `init` (ftyp+moov with one trak) becomes the catalog rendition's CMAF init unchanged, and the codec, description, and dimensions come from it. You draw the groups with `CreateGroup`/`AppendGroup`; `WriteFragment` takes any leading boxes (such as `uuid`), then one `moof` and one `mdat`, and stamps the frame with the first sample's presentation time. Finishing the track retires its rendition. The track skips the timeline and the catalog's bitrate and jitter measurement.
+
 The three advertising operations: `client.CreateBroadcast(path)` (or
 `origin.CreateBroadcast`) returns an unannounced producer, invisible to everyone;
 `broadcast.Announce(route)` / `broadcast.Unannounce()` own that exact-path
