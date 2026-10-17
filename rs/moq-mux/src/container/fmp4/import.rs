@@ -84,7 +84,7 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 ///
 /// Both arms own the private catalog entry, so publishing what the estimator measured and retiring
 /// the entry on drop is the same code either way.
-enum Rendition<E: crate::catalog::hang::CatalogExt> {
+pub(super) enum Rendition<E: crate::catalog::hang::CatalogExt> {
 	Video(crate::catalog::VideoTrack<E>),
 	Audio(crate::catalog::AudioTrack<E>),
 }
@@ -327,13 +327,13 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			// `estimate` as fragments arrive.
 			let rendition = match kind {
 				Kind::Video => {
-					let config = self.init_video(trak, &moov)?;
+					let config = init_video(trak, container(trak, &moov)?)?;
 					let mut rendition = reserved.init(track.name())?;
 					rendition.set(config)?;
 					Rendition::Video(rendition)
 				}
 				Kind::Audio => {
-					let config = self.init_audio(trak, &moov)?;
+					let config = init_audio(trak, container(trak, &moov)?)?;
 					let mut rendition = reserved.init(track.name())?;
 					rendition.set(config)?;
 					Rendition::Audio(rendition)
@@ -409,290 +409,287 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		);
 		Ok(true)
 	}
+}
 
-	fn container(&self, trak: &Trak, moov: &Moov) -> Result<Container> {
-		// Build a single-track init segment (ftyp+moov) for this track.
-		{
-			let ftyp = mp4_atom::Ftyp {
-				major_brand: b"isom".into(),
-				minor_version: 0x200,
-				compatible_brands: vec![b"isom".into(), b"iso6".into(), b"mp41".into()],
-			};
+/// A single-track init segment (ftyp+moov) for `trak`, cut out of a multi-track `moov`.
+fn container(trak: &Trak, moov: &Moov) -> Result<Container> {
+	let ftyp = mp4_atom::Ftyp {
+		major_brand: b"isom".into(),
+		minor_version: 0x200,
+		compatible_brands: vec![b"isom".into(), b"iso6".into(), b"mp41".into()],
+	};
 
-			// Build a moov with just this single track and matching mvex/trex.
-			let track_id = trak.tkhd.track_id;
-			let trex = moov
-				.mvex
-				.as_ref()
-				.and_then(|mvex| mvex.trex.iter().find(|trex| trex.track_id == track_id))
-				.cloned()
-				.unwrap_or(mp4_atom::Trex {
-					track_id,
-					default_sample_description_index: 1,
-					..Default::default()
-				});
+	// Build a moov with just this single track and matching mvex/trex.
+	let track_id = trak.tkhd.track_id;
+	let trex = moov
+		.mvex
+		.as_ref()
+		.and_then(|mvex| mvex.trex.iter().find(|trex| trex.track_id == track_id))
+		.cloned()
+		.unwrap_or(mp4_atom::Trex {
+			track_id,
+			default_sample_description_index: 1,
+			..Default::default()
+		});
 
-			let single_moov = Moov {
-				mvhd: moov.mvhd.clone(),
-				trak: vec![trak.clone()],
-				mvex: Some(mp4_atom::Mvex {
-					mehd: None,
-					trex: vec![trex],
-				}),
-				ainf: None,
-				meta: None,
-				udta: None,
-			};
+	let single_moov = Moov {
+		mvhd: moov.mvhd.clone(),
+		trak: vec![trak.clone()],
+		mvex: Some(mp4_atom::Mvex {
+			mehd: None,
+			trex: vec![trex],
+		}),
+		ainf: None,
+		meta: None,
+		udta: None,
+	};
 
-			let mut buf = Vec::new();
-			ftyp.encode(&mut buf)?;
-			single_moov.encode(&mut buf)?;
+	let mut buf = Vec::new();
+	ftyp.encode(&mut buf)?;
+	single_moov.encode(&mut buf)?;
 
-			Ok(Container::Cmaf { init: buf.into() })
+	Ok(Container::Cmaf { init: buf.into() })
+}
+
+/// The catalog rendition for a video `trak`, carried in `container`.
+pub(super) fn init_video(trak: &Trak, container: Container) -> Result<VideoConfig> {
+	let stsd = &trak.mdia.minf.stbl.stsd;
+
+	let codec = match stsd.codecs.len() {
+		0 => return Err(Error::MissingCodec.into()),
+		1 => &stsd.codecs[0],
+		_ => return Err(Error::MultipleCodecs.into()),
+	};
+
+	let (mut config, colr) = match codec {
+		mp4_atom::Codec::Avc1(avc1) => (
+			init_h264(false, &avc1.avcc, &avc1.visual, container)?,
+			avc1.colr.as_ref(),
+		),
+		mp4_atom::Codec::Avc3(avc3) => (
+			init_h264(true, &avc3.avcc, &avc3.visual, container)?,
+			avc3.colr.as_ref(),
+		),
+		mp4_atom::Codec::Hev1(hev1) => (
+			init_h265(true, &hev1.hvcc, &hev1.visual, container)?,
+			hev1.colr.as_ref(),
+		),
+		mp4_atom::Codec::Hvc1(hvc1) => (
+			init_h265(false, &hvc1.hvcc, &hvc1.visual, container)?,
+			hvc1.colr.as_ref(),
+		),
+		mp4_atom::Codec::Vp08(vp08) => {
+			let mut config = VideoConfig::new(VideoCodec::VP8);
+			// vpcC carries VP8's colour too; its range is always explicit.
+			let vpcc = &vp08.vpcc;
+			config.color = crate::codec::color::cicp(
+				vpcc.color_primaries,
+				vpcc.transfer_characteristics,
+				vpcc.matrix_coefficients,
+				Some(vpcc.video_full_range_flag),
+			);
+			config.coded_width = Some(vp08.visual.width as _);
+			config.coded_height = Some(vp08.visual.height as _);
+			config.container = container;
+			(config, vp08.colr.as_ref())
 		}
-	}
+		mp4_atom::Codec::Vp09(vp09) => {
+			// https://github.com/gpac/mp4box.js/blob/325741b592d910297bf609bc7c400fc76101077b/src/box-codecs.js#L238
+			let vpcc = &vp09.vpcc;
 
-	fn init_video(&mut self, trak: &Trak, moov: &Moov) -> Result<VideoConfig> {
-		let container = self.container(trak, moov)?;
-		let stsd = &trak.mdia.minf.stbl.stsd;
+			let vp9 = VP9 {
+				profile: vpcc.profile,
+				level: vpcc.level,
+				bit_depth: vpcc.bit_depth,
+				color_primaries: vpcc.color_primaries,
+				chroma_subsampling: vpcc.chroma_subsampling,
+				transfer_characteristics: vpcc.transfer_characteristics,
+				matrix_coefficients: vpcc.matrix_coefficients,
+				full_range: vpcc.video_full_range_flag,
+			};
+			let mut config = VideoConfig::new(vp9.clone());
+			config.color = crate::codec::vp9::color(&vp9);
+			config.coded_width = Some(vp09.visual.width as _);
+			config.coded_height = Some(vp09.visual.height as _);
+			config.container = container;
+			(config, vp09.colr.as_ref())
+		}
+		mp4_atom::Codec::Av01(av01) => {
+			let mut config = VideoConfig::new(crate::codec::av1::av1_from_av1c(&av01.av1c));
+			config.color = crate::codec::av1::color(&av01.av1c.config_obus);
+			config.coded_width = Some(av01.visual.width as _);
+			config.coded_height = Some(av01.visual.height as _);
+			config.container = container;
+			(config, av01.colr.as_ref())
+		}
+		mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
+		unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
+	};
+	// The codec config outranks the colr box a muxer added, which only fills its gaps.
+	let colr = colr.map(super::colr_color).transpose()?.flatten();
+	crate::codec::color::fill(&mut config.color, colr.as_ref(), "colr");
 
-		let codec = match stsd.codecs.len() {
-			0 => return Err(Error::MissingCodec.into()),
-			1 => &stsd.codecs[0],
-			_ => return Err(Error::MultipleCodecs.into()),
-		};
+	Ok(config)
+}
 
-		let (mut config, colr) = match codec {
-			mp4_atom::Codec::Avc1(avc1) => (
-				self.init_h264(false, &avc1.avcc, &avc1.visual, container)?,
-				avc1.colr.as_ref(),
-			),
-			mp4_atom::Codec::Avc3(avc3) => (
-				self.init_h264(true, &avc3.avcc, &avc3.visual, container)?,
-				avc3.colr.as_ref(),
-			),
-			mp4_atom::Codec::Hev1(hev1) => (
-				self.init_h265(true, &hev1.hvcc, &hev1.visual, container)?,
-				hev1.colr.as_ref(),
-			),
-			mp4_atom::Codec::Hvc1(hvc1) => (
-				self.init_h265(false, &hvc1.hvcc, &hvc1.visual, container)?,
-				hvc1.colr.as_ref(),
-			),
-			mp4_atom::Codec::Vp08(vp08) => {
-				let mut config = VideoConfig::new(VideoCodec::VP8);
-				// vpcC carries VP8's colour too; its range is always explicit.
-				let vpcc = &vp08.vpcc;
-				config.color = crate::codec::color::cicp(
-					vpcc.color_primaries,
-					vpcc.transfer_characteristics,
-					vpcc.matrix_coefficients,
-					Some(vpcc.video_full_range_flag),
-				);
-				config.coded_width = Some(vp08.visual.width as _);
-				config.coded_height = Some(vp08.visual.height as _);
-				config.container = container;
-				(config, vp08.colr.as_ref())
+/// The avcC stays the description even for avc3, where it may list no parameter
+/// sets: it still carries the NAL length size the samples are framed with.
+fn init_h264(
+	inline: bool,
+	avcc: &mp4_atom::Avcc,
+	visual: &mp4_atom::Visual,
+	container: Container,
+) -> Result<VideoConfig> {
+	let mut description = BytesMut::new();
+	avcc.encode_body(&mut description)?;
+	let metadata = crate::codec::h264::config(&description)?;
+
+	let mut config = VideoConfig::new(H264 {
+		profile: avcc.avc_profile_indication,
+		constraints: avcc.profile_compatibility,
+		level: avcc.avc_level_indication,
+		inline,
+	});
+	config.coded_width = Some(visual.width as _);
+	config.coded_height = Some(visual.height as _);
+	config.framerate = metadata.framerate;
+	config.display_aspect_width = metadata.display_aspect_width;
+	config.display_aspect_height = metadata.display_aspect_height;
+	config.color = metadata.color;
+	config.description = Some(description.freeze());
+	config.container = container;
+	Ok(config)
+}
+
+fn init_h265(
+	in_band: bool,
+	hvcc: &mp4_atom::Hvcc,
+	visual: &mp4_atom::Visual,
+	container: Container,
+) -> Result<VideoConfig> {
+	let mut description = BytesMut::new();
+	hvcc.encode_body(&mut description)?;
+
+	let mut config = VideoConfig::new(H265 {
+		in_band,
+		profile_space: hvcc.general_profile_space,
+		profile_idc: hvcc.general_profile_idc,
+		profile_compatibility_flags: hvcc.general_profile_compatibility_flags,
+		tier_flag: hvcc.general_tier_flag,
+		level_idc: hvcc.general_level_idc,
+		constraint_flags: hvcc.general_constraint_indicator_flags,
+	});
+	config.description = Some(description.freeze());
+	config.coded_width = Some(visual.width as _);
+	config.coded_height = Some(visual.height as _);
+	crate::codec::h265::apply_hvcc_sps(hvcc, &mut config)?;
+	config.container = container;
+	Ok(config)
+}
+
+/// The catalog rendition for an audio `trak`, carried in `container`.
+pub(super) fn init_audio(trak: &Trak, container: Container) -> Result<AudioConfig> {
+	let stsd = &trak.mdia.minf.stbl.stsd;
+
+	let codec = match stsd.codecs.len() {
+		0 => return Err(Error::MissingCodec.into()),
+		1 => &stsd.codecs[0],
+		_ => return Err(Error::MultipleCodecs.into()),
+	};
+
+	let config = match codec {
+		mp4_atom::Codec::Mp4a(mp4a) => {
+			let desc = &mp4a.esds.es_desc.dec_config;
+
+			// TODO Also support mp4a.67
+			if desc.object_type_indication != 0x40 {
+				return Err(Error::UnsupportedMpeg2.into());
 			}
-			mp4_atom::Codec::Vp09(vp09) => {
-				// https://github.com/gpac/mp4box.js/blob/325741b592d910297bf609bc7c400fc76101077b/src/box-codecs.js#L238
-				let vpcc = &vp09.vpcc;
 
-				let vp9 = VP9 {
-					profile: vpcc.profile,
-					level: vpcc.level,
-					bit_depth: vpcc.bit_depth,
-					color_primaries: vpcc.color_primaries,
-					chroma_subsampling: vpcc.chroma_subsampling,
-					transfer_characteristics: vpcc.transfer_characteristics,
-					matrix_coefficients: vpcc.matrix_coefficients,
-					full_range: vpcc.video_full_range_flag,
-				};
-				let mut config = VideoConfig::new(vp9.clone());
-				config.color = crate::codec::vp9::color(&vp9);
-				config.coded_width = Some(vp09.visual.width as _);
-				config.coded_height = Some(vp09.visual.height as _);
-				config.container = container;
-				(config, vp09.colr.as_ref())
+			// The descriptor's bitrate is optional: a 0 means "unknown", so leave the field unset
+			// and let the frame-size detector fill it instead of publishing a bogus 0.
+			let bitrate = desc.avg_bitrate.max(desc.max_bitrate);
+			let dec_specific = desc.dec_specific.as_ref().ok_or(Error::MissingDecoderSpecific)?;
+			let profile = dec_specific.profile;
+			let sample_rate = mp4a.audio.sample_rate.integer() as u32;
+			let channel_count = mp4a.audio.channel_count as u32;
+
+			// Keep the complete AudioSpecificConfig so SBR/PS extensions reach the decoder.
+			let description = bytes::Bytes::copy_from_slice(&dec_specific.raw);
+
+			let mut config = AudioConfig::new(AAC { profile }, sample_rate, channel_count);
+			if bitrate > 0 {
+				config.bitrate = Some(bitrate.into());
 			}
-			mp4_atom::Codec::Av01(av01) => {
-				let mut config = VideoConfig::new(crate::codec::av1::av1_from_av1c(&av01.av1c));
-				config.color = crate::codec::av1::color(&av01.av1c.config_obus);
-				config.coded_width = Some(av01.visual.width as _);
-				config.coded_height = Some(av01.visual.height as _);
-				config.container = container;
-				(config, av01.colr.as_ref())
-			}
-			mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
-			unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
-		};
-		// The codec config outranks the colr box a muxer added, which only fills its gaps.
-		let colr = colr.map(super::colr_color).transpose()?.flatten();
-		crate::codec::color::fill(&mut config.color, colr.as_ref(), "colr");
+			config.description = Some(description);
+			config.container = container;
+			config
+		}
+		mp4_atom::Codec::Opus(opus) => {
+			// dOps carries the OpusHead fields in ISOBMFF byte order; republish them as the
+			// OpusHead description so decoders apply its pre-skip and gain. mp4-atom already
+			// refuses a nonzero channel mapping family, so the table is never dropped here.
+			let dops = &opus.dops;
+			let mut head = crate::codec::opus::Config::new(dops.input_sample_rate, dops.output_channel_count as u32)
+				.with_pre_skip(dops.pre_skip);
+			head.output_gain = dops.output_gain;
 
-		Ok(config)
-	}
+			// The shared conversion sets the decoder's 48 kHz output rate and Opus warmup,
+			// whatever the sample entry or the informational input rate claims.
+			let description = head.encode()?;
+			let mut config: AudioConfig = head.into();
+			config.description = Some(description);
+			config.container = container;
+			config
+		}
+		mp4_atom::Codec::Flac(flac) => {
+			// Rate/channels come from STREAMINFO, not the sample entry's `Audio`
+			// box: the latter's sample rate is 16.16 fixed point and can't carry
+			// FLAC's high rates (96k/192k). STREAMINFO is also where the decoder
+			// description comes from.
+			let info = flac
+				.dfla
+				.blocks
+				.iter()
+				.find_map(|block| match block {
+					mp4_atom::FlacMetadataBlock::StreamInfo {
+						minimum_block_size,
+						maximum_block_size,
+						minimum_frame_size,
+						maximum_frame_size,
+						sample_rate,
+						num_channels_minus_one,
+						bits_per_sample_minus_one,
+						number_of_interchannel_samples,
+						md5_checksum,
+					} => Some(crate::codec::flac::Config {
+						min_block_size: *minimum_block_size,
+						max_block_size: *maximum_block_size,
+						min_frame_size: u32::from(*minimum_frame_size),
+						max_frame_size: u32::from(*maximum_frame_size),
+						sample_rate: *sample_rate,
+						channel_count: *num_channels_minus_one as u32 + 1,
+						bits_per_sample: *bits_per_sample_minus_one as u32 + 1,
+						total_samples: *number_of_interchannel_samples,
+						md5: md5_checksum.as_slice().try_into().unwrap_or([0; 16]),
+					}),
+					_ => None,
+				})
+				.ok_or(crate::codec::flac::Error::MissingStreamInfo)?;
 
-	/// The avcC stays the description even for avc3, where it may list no parameter
-	/// sets: it still carries the NAL length size the samples are framed with.
-	fn init_h264(
-		&mut self,
-		inline: bool,
-		avcc: &mp4_atom::Avcc,
-		visual: &mp4_atom::Visual,
-		container: Container,
-	) -> Result<VideoConfig> {
-		let mut description = BytesMut::new();
-		avcc.encode_body(&mut description)?;
-		let metadata = crate::codec::h264::config(&description)?;
+			let mut config = AudioConfig::new(AudioCodec::Flac, info.sample_rate, info.channel_count);
+			config.description = Some(info.description());
+			config.container = container;
+			config
+		}
+		mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
+		unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
+	};
 
-		let mut config = VideoConfig::new(H264 {
-			profile: avcc.avc_profile_indication,
-			constraints: avcc.profile_compatibility,
-			level: avcc.avc_level_indication,
-			inline,
-		});
-		config.coded_width = Some(visual.width as _);
-		config.coded_height = Some(visual.height as _);
-		config.framerate = metadata.framerate;
-		config.display_aspect_width = metadata.display_aspect_width;
-		config.display_aspect_height = metadata.display_aspect_height;
-		config.color = metadata.color;
-		config.description = Some(description.freeze());
-		config.container = container;
-		Ok(config)
-	}
+	Ok(config)
+}
 
-	fn init_h265(
-		&mut self,
-		in_band: bool,
-		hvcc: &mp4_atom::Hvcc,
-		visual: &mp4_atom::Visual,
-		container: Container,
-	) -> Result<VideoConfig> {
-		let mut description = BytesMut::new();
-		hvcc.encode_body(&mut description)?;
-
-		let mut config = VideoConfig::new(H265 {
-			in_band,
-			profile_space: hvcc.general_profile_space,
-			profile_idc: hvcc.general_profile_idc,
-			profile_compatibility_flags: hvcc.general_profile_compatibility_flags,
-			tier_flag: hvcc.general_tier_flag,
-			level_idc: hvcc.general_level_idc,
-			constraint_flags: hvcc.general_constraint_indicator_flags,
-		});
-		config.description = Some(description.freeze());
-		config.coded_width = Some(visual.width as _);
-		config.coded_height = Some(visual.height as _);
-		crate::codec::h265::apply_hvcc_sps(hvcc, &mut config)?;
-		config.container = container;
-		Ok(config)
-	}
-
-	fn init_audio(&mut self, trak: &Trak, moov: &Moov) -> Result<AudioConfig> {
-		let container = self.container(trak, moov)?;
-		let stsd = &trak.mdia.minf.stbl.stsd;
-
-		let codec = match stsd.codecs.len() {
-			0 => return Err(Error::MissingCodec.into()),
-			1 => &stsd.codecs[0],
-			_ => return Err(Error::MultipleCodecs.into()),
-		};
-
-		let config = match codec {
-			mp4_atom::Codec::Mp4a(mp4a) => {
-				let desc = &mp4a.esds.es_desc.dec_config;
-
-				// TODO Also support mp4a.67
-				if desc.object_type_indication != 0x40 {
-					return Err(Error::UnsupportedMpeg2.into());
-				}
-
-				// The descriptor's bitrate is optional: a 0 means "unknown", so leave the field unset
-				// and let the frame-size detector fill it instead of publishing a bogus 0.
-				let bitrate = desc.avg_bitrate.max(desc.max_bitrate);
-				let dec_specific = desc.dec_specific.as_ref().ok_or(Error::MissingDecoderSpecific)?;
-				let profile = dec_specific.profile;
-				let sample_rate = mp4a.audio.sample_rate.integer() as u32;
-				let channel_count = mp4a.audio.channel_count as u32;
-
-				// Keep the complete AudioSpecificConfig so SBR/PS extensions reach the decoder.
-				let description = bytes::Bytes::copy_from_slice(&dec_specific.raw);
-
-				let mut config = AudioConfig::new(AAC { profile }, sample_rate, channel_count);
-				if bitrate > 0 {
-					config.bitrate = Some(bitrate.into());
-				}
-				config.description = Some(description);
-				config.container = container;
-				config
-			}
-			mp4_atom::Codec::Opus(opus) => {
-				// dOps carries the OpusHead fields in ISOBMFF byte order; republish them as the
-				// OpusHead description so decoders apply its pre-skip and gain. mp4-atom already
-				// refuses a nonzero channel mapping family, so the table is never dropped here.
-				let dops = &opus.dops;
-				let mut head =
-					crate::codec::opus::Config::new(dops.input_sample_rate, dops.output_channel_count as u32)
-						.with_pre_skip(dops.pre_skip);
-				head.output_gain = dops.output_gain;
-
-				// The shared conversion sets the decoder's 48 kHz output rate and Opus warmup,
-				// whatever the sample entry or the informational input rate claims.
-				let description = head.encode()?;
-				let mut config: AudioConfig = head.into();
-				config.description = Some(description);
-				config.container = container;
-				config
-			}
-			mp4_atom::Codec::Flac(flac) => {
-				// Rate/channels come from STREAMINFO, not the sample entry's `Audio`
-				// box: the latter's sample rate is 16.16 fixed point and can't carry
-				// FLAC's high rates (96k/192k). STREAMINFO is also where the decoder
-				// description comes from.
-				let info = flac
-					.dfla
-					.blocks
-					.iter()
-					.find_map(|block| match block {
-						mp4_atom::FlacMetadataBlock::StreamInfo {
-							minimum_block_size,
-							maximum_block_size,
-							minimum_frame_size,
-							maximum_frame_size,
-							sample_rate,
-							num_channels_minus_one,
-							bits_per_sample_minus_one,
-							number_of_interchannel_samples,
-							md5_checksum,
-						} => Some(crate::codec::flac::Config {
-							min_block_size: *minimum_block_size,
-							max_block_size: *maximum_block_size,
-							min_frame_size: u32::from(*minimum_frame_size),
-							max_frame_size: u32::from(*maximum_frame_size),
-							sample_rate: *sample_rate,
-							channel_count: *num_channels_minus_one as u32 + 1,
-							bits_per_sample: *bits_per_sample_minus_one as u32 + 1,
-							total_samples: *number_of_interchannel_samples,
-							md5: md5_checksum.as_slice().try_into().unwrap_or([0; 16]),
-						}),
-						_ => None,
-					})
-					.ok_or(crate::codec::flac::Error::MissingStreamInfo)?;
-
-				let mut config = AudioConfig::new(AudioCodec::Flac, info.sample_rate, info.channel_count);
-				config.description = Some(info.description());
-				config.container = container;
-				config
-			}
-			mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
-			unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
-		};
-
-		Ok(config)
-	}
-
+impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Whether the fragments in `moof` open a new segment, and so roll a group on every track.
 	///
 	/// A segment is the unit a group carries: each fragment inside it becomes a frame, which is
